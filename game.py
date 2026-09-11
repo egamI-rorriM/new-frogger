@@ -162,6 +162,8 @@ class Game:
         self.wave_scale = 1.0
         self.death_timer = 0.0      # frames remaining for death animation
         self.in_water_grace = 0.0   # grace period before water kills you
+        self.wave_transition_timer = 0.0
+        self.paused = False
         self.reset_wave()
 
     def play_sound(self, sound_name: str):
@@ -174,6 +176,8 @@ class Game:
         self.wave_scale = min(2.0, 1.0 + (self.wave - 1) * WAVE_SPEED_MULT)
         self.cars.empty()
         self.logs.empty()
+        self.last_car_spawn = {}    # Reset spawn timers for new wave
+        self.last_wood_spawn = {}   # Reset spawn timers for new wave
         # spawn initial cars
         # Map vehicle names to their sprite generators
         _VEHICLE_SPRITES = {
@@ -242,18 +246,17 @@ class Game:
         if idx is not None and not self.home_fills[idx]:
             self.home_fills[idx] = True
             self.score += SCORE_HOME
-            self.play_sound("sfx_ding")  # Play ding sound when reaching home
-            # Teleport frog back to spawn after reaching home
-            self.frog.col = (COLS - 1) // 2
-            self.frog.row = SPAWN_ROW
+            self.play_sound("sfx_ding")
+            self.frog.reset()
             if all(self.home_fills):
-                # all homes filled — advance wave!
                 self.wave += 1
                 if self.wave > WIN_WAVE:
                     self.state = STATE_WIN
                 else:
-                    self.reset_wave()
-                    self.home_fills = [False] * HOME_SLOT_COUNT  # clear for new wave
+                    self.score += WAVE_BONUS
+                    # Trigger wave transition screen
+                    self.state = STATE_WAVE_TRANSITION
+                    self.wave_transition_timer = WAVE_TRANSITION_TIME
 
     def check_wood_riding(self):
         """Update frog's wood-riding state."""
@@ -261,7 +264,9 @@ class Game:
         # Use rect intersection for reliable grid-hop sticking (fixes falling)
         frog_rect = pygame.Rect(int(self.frog.x - 12), int(self.frog.y - 12), 24, 24)
         for log in self.logs:
-            if frog_rect.colliderect(log.rect):
+            # inflate log hitbox for forgiving riding
+            log_hit = log.rect.inflate(8, 8)
+            if frog_rect.colliderect(log_hit):
                 self.frog.on_wood = log
                 break
 
@@ -274,7 +279,15 @@ class Game:
 
     def update(self, dt: float):
         """Update all game logic every frame."""
-        if self.state != STATE_PLAYING:
+        if self.state == STATE_WAVE_TRANSITION:
+            self.wave_transition_timer -= dt
+            if self.wave_transition_timer <= 0:
+                self.reset_wave()
+                self.home_fills = [False] * HOME_SLOT_COUNT
+                self.state = STATE_PLAYING
+            return
+
+        if self.state == STATE_PAUSED or self.state != STATE_PLAYING:
             return
 
         # update frog animation
@@ -288,6 +301,33 @@ class Game:
             if (car.direction == -1 and car.rect.right < 0) or \
                (car.direction == +1 and car.rect.left > CANVAS_WIDTH):
                 car.kill()
+
+        # Continuous spawning of cars from the correct edge
+        _VEHICLE_SPRITES = {
+            "car_red": car_red, "car_blue": car_blue, "car_yellow": car_yellow,
+            "car_green": car_green, "car_orange": car_orange,
+        }
+        for lane in ROAD_LANES:
+            row = lane["row"]
+            dirn = lane["direction"]
+            vehicle_name = lane["vehicles"][0]
+            colour_fn = _VEHICLE_SPRITES.get(vehicle_name, car_red)
+
+            if row not in self.last_car_spawn:
+                self.last_car_spawn[row] = 0
+
+            self.last_car_spawn[row] += 1
+            interval_s = lane.get("interval", 80)
+
+            if self.last_car_spawn[row] >= interval_s:
+                self.last_car_spawn[row] = 0
+
+                # Spawn just outside the screen edge OPPOSITE to movement direction
+                spawn_x = -TILE_SIZE // 2 if dirn == 1 else CANVAS_WIDTH + TILE_SIZE // 2
+
+                v = Vehicle(lane["row"], spawn_x, dirn, colour_fn)
+                v.speed = lane["speed"] * self.wave_scale * TILE_SIZE
+                self.cars.add(v)
 
         # update logs
         for log in self.logs:
@@ -318,18 +358,20 @@ class Game:
                 width = 36 if obj_type == "log" else 40
                 fn = sprite_map.get(obj_type, log_brown)
                 
-                # Spawn just outside the screen edge based on direction
-                spawn_x = CANVAS_WIDTH + TILE_SIZE // 2 if dirn == 1 else -TILE_SIZE // 2
+                # Spawn just outside the screen edge OPPOSITE to movement direction
+                spawn_x = -TILE_SIZE // 2 if dirn == 1 else CANVAS_WIDTH + TILE_SIZE // 2
                 
                 flo = FloatingEntity(row, spawn_x, width, dirn, obj_type, fn)
                 flo.speed = lane["speed"] * self.wave_scale * TILE_SIZE # <-- Fixed: multiply by TILE_SIZE!
                 self.logs.add(flo)
 
-        # check collision with cars
+        # check collision with cars (forgiving hitbox)
         frog_rect = pygame.Rect(
             int(self.frog.x - 12), int(self.frog.y - 12), 24, 24)
         for car in self.cars:
-            if car.rect.colliderect(frog_rect):
+            # shrink car hitbox so more overlap is required
+            car_hit = car.rect.inflate(-12, -12)
+            if car_hit.colliderect(frog_rect):
                 self.respawn()
                 return
 
@@ -376,8 +418,8 @@ class Game:
             pygame.draw.rect(screen, color, rect, border_radius=6)
 
         # spawn marker
-        sx = SPAWN_ROW * TILE_SIZE + (TILE_SIZE // 2)
-        sy = 7 * TILE_SIZE + (TILE_SIZE // 2)
+        sx = 7 * TILE_SIZE + (TILE_SIZE // 2)
+        sy = SPAWN_ROW * TILE_SIZE + (TILE_SIZE // 2)
         pygame.draw.circle(screen, WHITE, (sx, sy), 18, 3)
 
         # draw logs & turtles
@@ -393,15 +435,49 @@ class Game:
             img = frog_hop() if self.frog.moving else frog_idle()
             screen.blit(img, (int(self.frog.x - 16), int(self.frog.y - 16)))
 
+        # overlays
+        if self.state == STATE_WAVE_TRANSITION:
+            overlay = pygame.Surface((CANVAS_WIDTH, CANVAS_HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 180))
+            screen.blit(overlay, (0, 0))
+            font_big = pygame.font.SysFont(None, 72)
+            text = font_big.render(f"Wave {self.wave} Complete!", True, FROG_GREEN)
+            rect = text.get_rect(center=(CANVAS_WIDTH // 2, CANVAS_HEIGHT // 3))
+            screen.blit(text, rect)
+            font_med = pygame.font.SysFont(None, 36)
+            bonus_text = font_med.render(f"+{WAVE_BONUS} Bonus", True, WHITE)
+            rect2 = bonus_text.get_rect(center=(CANVAS_WIDTH // 2, CANVAS_HEIGHT // 2))
+            screen.blit(bonus_text, rect2)
+        elif self.state == STATE_PAUSED:
+            overlay = pygame.Surface((CANVAS_WIDTH, CANVAS_HEIGHT), pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 180))
+            screen.blit(overlay, (0, 0))
+            font_big = pygame.font.SysFont(None, 72)
+            text = font_big.render("PAUSED", True, WHITE)
+            rect = text.get_rect(center=(CANVAS_WIDTH // 2, CANVAS_HEIGHT // 2))
+            screen.blit(text, rect)
+            font_med = pygame.font.SysFont(None, 28)
+            hint = font_med.render("Press P to Resume", True, WHITE)
+            rect2 = hint.get_rect(center=(CANVAS_WIDTH // 2, CANVAS_HEIGHT // 2 + 60))
+            screen.blit(hint, rect2)
+
         # HUD (drawn by main loop)
 
     def handle_input(self, events):
         """Process keyboard input for frog movement."""
+        if self.state == STATE_PAUSED:
+            for event in events:
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_p:
+                        self.state = STATE_PLAYING
+            return
         if self.state != STATE_PLAYING:
             return
         for event in events:
             if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_UP:
+                if event.key == pygame.K_p:
+                    self.state = STATE_PAUSED
+                elif event.key == pygame.K_UP:
                     self.frog.move(0, -1)
                     self.play_sound("sfx_hop")
                 elif event.key == pygame.K_DOWN:

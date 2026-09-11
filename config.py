@@ -82,3 +82,8 @@ STATE_PLAYING = "playing"
 STATE_DYING = "dying"       # brief death animation / invulnerability
 STATE_WIN = "win"
 STATE_GAMEOVER = "gameover"
+STATE_PAUSED = "paused"
+STATE_WAVE_TRANSITION = "wave_transition"
+
+# ── Transition timing ────────────────────────────────────────────────────────
+WAVE_TRANSITION_TIME = 1.5  # seconds to show wave complete screen
